@@ -1,8 +1,11 @@
 /**
  * Private document storage abstraction.
  * - Development: local private directory (never /public)
- * - Production: S3-compatible private bucket
- * Documents must NEVER have public URLs.
+ * - Production: Vercel Blob private store, or an S3-compatible private bucket
+ *
+ * Documents must NEVER have public URLs. Blobs are written with
+ * `access: 'private'` so the store URL alone is not enough to read a file;
+ * reads always go through `get()` inside the authenticated download routes.
  */
 import { appConfig } from '@/lib/config';
 
@@ -35,7 +38,18 @@ let provider: StorageProvider | null = null;
 
 export function getStorage(): StorageProvider {
   if (provider) return provider;
-  if (appConfig.storage.provider === 's3' && appConfig.storage.bucket) {
+  const { provider: name } = appConfig.storage;
+  if (name === 'blob') {
+    // Fail loudly rather than falling back to the local filesystem: on Vercel
+    // the filesystem is read-only and ephemeral, so a silent fallback would
+    // appear to "work" on write and then lose every file on the next deploy.
+    if (!appConfig.storage.blobToken) {
+      throw new Error('BLOB_READ_WRITE_TOKEN is required when STORAGE_PROVIDER=blob');
+    }
+    // Lazy import keeps the Blob client out of the local-dev bundle.
+    const mod = require('./blob') as typeof import('./blob');
+    provider = new mod.BlobStorageProvider(appConfig.storage.blobToken);
+  } else if (name === 's3' && appConfig.storage.bucket) {
     // Lazy import keeps the S3 code out of the dev bundle.
     const mod = require('./s3') as typeof import('./s3');
     provider = new mod.S3StorageProvider(

@@ -8,8 +8,10 @@ export const appConfig = {
   sessionCookieName: process.env.SESSION_COOKIE_NAME ?? 'goodfellas_session',
   appUrl: process.env.APP_URL ?? 'http://localhost:3000',
   storage: {
-    provider: (process.env.STORAGE_PROVIDER ?? 'local') as 'local' | 's3',
+    provider: (process.env.STORAGE_PROVIDER ?? 'local') as 'local' | 's3' | 'blob',
     localRoot: process.env.STORAGE_LOCAL_ROOT ?? './storage/private',
+    // Vercel Blob store token. Server-side only — never expose to the client.
+    blobToken: process.env.BLOB_READ_WRITE_TOKEN ?? '',
     bucket: process.env.STORAGE_BUCKET ?? '',
     region: process.env.STORAGE_REGION ?? '',
     accessKey: process.env.STORAGE_ACCESS_KEY ?? '',

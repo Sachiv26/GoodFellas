@@ -3,6 +3,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { PrismaClient } from '@prisma/client';
 import { PDFDocument } from 'pdf-lib';
+import { getStorage } from '../src/lib/storage';
 
 const db = new PrismaClient();
 const root = path.resolve(process.cwd(), 'prisma/seed-assets/vehiclelicenserenewalform.pdf');
@@ -54,10 +55,10 @@ async function main() {
   const pdfBytes = await fs.readFile(root);
   const pdf = await PDFDocument.load(pdfBytes);
   const templateStorageKey = `templates/ALV9_2011_07/v1/vehiclelicenserenewalform.pdf`;
-  const localRoot = path.resolve(process.cwd(), process.env.STORAGE_LOCAL_ROOT ?? './storage/private');
-  const target = path.join(localRoot, templateStorageKey);
-  await fs.mkdir(path.dirname(target), { recursive: true });
-  await fs.writeFile(target, pdfBytes);
+  // Upload through the storage abstraction rather than writing to disk: the
+  // Vercel filesystem is read-only, so a direct writeFile would fail in
+  // production and the template would never reach the blob store.
+  await getStorage().put(templateStorageKey, Buffer.from(pdfBytes), 'application/pdf');
   const template = await db.pdfTemplate.upsert({ where: { code: 'ALV9_2011_07' }, update: { name: 'ALV(9)(2011/07) - fillable', storageKey: templateStorageKey, pageCount: pdf.getPageCount(), hasAcroForm: true, active: true, version: 2 }, create: { name: 'ALV(9)(2011/07) - fillable', code: 'ALV9_2011_07', description: 'Application for licensing of motor vehicle - supplied fillable form', storageKey: templateStorageKey, pageCount: pdf.getPageCount(), hasAcroForm: true, active: true, version: 2 } });
   const fields = pdf.getForm().getFields();
   const mappingDefinitions: Array<[string, string, string, 'TEXT' | 'CHECKBOX', string | null]> = [];
