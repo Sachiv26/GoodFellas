@@ -1,16 +1,21 @@
-import { prisma } from '@/lib/db';
-import { appConfig } from '@/lib/config';
-import { getOcrProvider, type OcrProvider } from '@/lib/ocr';
+﻿import { prisma } from '@/lib/db';
 import { getBarcodeProvider } from '@/lib/barcode';
-import { preprocessForOcr, extractRawPixels } from '@/lib/ocr/preprocess';
+import { extractRawPixels } from '@/lib/ocr/preprocess';
 import { rasterizePdfPage } from '@/lib/ocr/pdf-raster';
-import { parsePdfText } from '@/lib/ocr/pdf-parse';
 import { parseDiscBarcode } from '@/lib/extraction/barcode-parser';
-import { runExtraction, runCrossDocumentValidation, fieldsToJson, buildCvInput, DOCUMENT_TYPE_CODES } from '@/lib/extraction';
+import { extractLicenceDiscFields } from '@/lib/extraction/disc-extractor';
+import { fieldsToJson } from '@/lib/extraction';
 import { getStorage } from '@/lib/storage';
 import { recalculateApplicationPrice } from './pricing-service';
 import { audit, AUDIT_ACTIONS } from '@/lib/audit';
 import type { ProcessingJob } from '@prisma/client';
+
+/** The one document type that carries machine-readable vehicle data. */
+const DISC_DOCUMENT_CODE = 'VEHICLE_LICENCE_DISC';
+
+/** Version tag for the barcode-derived extraction persisted below. */
+const BARCODE_EXTRACTION_VERSION = 'barcode-v1';
+
 /**
  * Document set inputs for the status decision.
  *
@@ -22,7 +27,8 @@ export interface StatusDecisionInput {
   documents: Array<{
     documentTypeId: string;
     status: string;
-    latestExtraction: { status: string; fieldCount: number } | null;
+    /** Number of barcode values decoded from this document, when it is a disc. */
+    barcodeFieldCount?: number;
   }>;
 }
 
@@ -37,7 +43,13 @@ export interface StatusDecision {
  * The decision is made from what has actually been uploaded, so the status
  * never depends on a background worker having run: an application with every
  * required document uploaded is DOCUMENTS_UPLOADED at once, and only advances
- * to DOCUMENT_REVIEW/COMPLETED as processing and extraction report in.
+ * to DOCUMENT_REVIEW/COMPLETED as processing reports in.
+ *
+ * There is no OCR or AI extraction step, so "processed" is the terminal state
+ * for a document. The licence disc is the exception: a disc that stored but
+ * decoded no barcode values has produced no usable vehicle data, so the
+ * application goes to DOCUMENT_REVIEW for manual attention rather than
+ * completing with a price that cannot be calculated.
  *
  * Precedence: a document needing review wins over completion so a failed
  * document is never hidden behind an otherwise-complete set.
@@ -50,13 +62,12 @@ export function decideApplicationStatus(input: StatusDecisionInput): StatusDecis
   const byType = new Map(documents.map((d) => [d.documentTypeId, d]));
   const allUploaded = required.every((id) => byType.has(id));
   const allProcessed = required.every((id) => byType.get(id)?.status === 'PROCESSED');
-  const allExtracted = required.every((id) => {
+  // A required disc only counts as usable once it has yielded vehicle data.
+  const discDecoded = required.every((id) => {
     const document = byType.get(id);
-    return (
-      document?.status === 'PROCESSED' &&
-      document.latestExtraction?.status === 'COMPLETED' &&
-      document.latestExtraction.fieldCount > 0
-    );
+    if (document?.status !== 'PROCESSED') return false;
+    if (document.barcodeFieldCount === undefined) return true;
+    return document.barcodeFieldCount > 0;
   });
   const needsReview = required.some((id) =>
     ['NEEDS_REVIEW', 'REJECTED'].includes(byType.get(id)?.status ?? '')
@@ -65,16 +76,16 @@ export function decideApplicationStatus(input: StatusDecisionInput): StatusDecis
   if (needsReview) {
     return { next: 'DOCUMENT_REVIEW', reason: 'A required document needs review' };
   }
-  if (allExtracted) {
+  if (allProcessed && discDecoded) {
     return {
       next: 'COMPLETED',
-      reason: 'All required documents uploaded and successfully extracted',
+      reason: 'All required documents processed and the licence disc barcode was decoded',
     };
   }
   if (allProcessed) {
     return {
-      next: 'DOCUMENTS_UPLOADED',
-      reason: 'All required documents processed; extraction is incomplete',
+      next: 'DOCUMENT_REVIEW',
+      reason: 'The licence disc barcode could not be decoded, so vehicle details are missing',
     };
   }
   if (allUploaded) {
@@ -93,18 +104,21 @@ export function decideApplicationStatus(input: StatusDecisionInput): StatusDecis
  * which blocks payment (which requires every document PROCESSED).
  *
  * Awaiting the pipeline here keeps the "never run OCR inside the upload
- * request" rule intact in the sense that matters — the enqueue is still a cheap
- * DB write and the client response is not blocked on the whole batch — while
+ * request" rule intact in the sense that matters â€” the enqueue is still a cheap
+ * DB write and the client response is not blocked on the whole batch â€” while
  * guaranteeing this document is actually processed. A real queue worker can
  * replace this call without any other change.
  */
-export async function processDocumentNow(documentId: string): Promise<void> {
+export async function processDocumentNow(
+  documentId: string,
+  options: { skipReprice?: boolean } = {}
+): Promise<void> {
   await prisma.processingJob.updateMany({
     where: { documentId, status: 'PENDING' },
     data: { status: 'RUNNING', startedAt: new Date(), attempts: { increment: 1 } },
   });
   try {
-    await runDocumentPipeline(documentId);
+    await runDocumentPipeline(documentId, options);
     await prisma.processingJob.updateMany({
       where: { documentId, status: 'RUNNING' },
       data: { status: 'COMPLETED', finishedAt: new Date(), error: null },
@@ -123,7 +137,7 @@ export async function processDocumentNow(documentId: string): Promise<void> {
 }
 
 export async function refreshApplicationStatus(applicationId: string, actorId = 'system'): Promise<void> {
-  const application = await prisma.application.findUnique({ where: { id: applicationId }, include: { product: { include: { documentRequirements: { where: { active: true }, select: { documentTypeId: true, required: true } } } }, documents: { where: { status: { not: 'REPLACED' } }, select: { documentTypeId: true, status: true, extractions: { orderBy: { createdAt: 'desc' }, take: 1, select: { status: true, fieldExtractions: { select: { id: true } } } } } } } });
+  const application = await prisma.application.findUnique({ where: { id: applicationId }, include: { product: { include: { documentRequirements: { where: { active: true }, select: { documentTypeId: true, required: true } } } }, documents: { where: { status: { not: 'REPLACED' } }, select: { documentTypeId: true, status: true, barcodes: { orderBy: { decodedAt: 'desc' }, take: 1, select: { decodedDataJson: true } } } } } });
   if (!application) return;
   const decision = decideApplicationStatus({
     requiredDocumentTypeIds: application.product.documentRequirements
@@ -132,9 +146,12 @@ export async function refreshApplicationStatus(applicationId: string, actorId = 
     documents: application.documents.map((d) => ({
       documentTypeId: d.documentTypeId,
       status: d.status,
-      latestExtraction: d.extractions[0]
-        ? { status: d.extractions[0].status, fieldCount: d.extractions[0].fieldExtractions.length }
-        : null,
+      // Only the disc carries vehicle data; a doc with no barcode rows at all
+      // must not be treated as a disc that failed to decode.
+      barcodeFieldCount:
+        d.barcodes[0] === undefined
+          ? undefined
+          : countBarcodeFields(d.barcodes[0].decodedDataJson),
     })),
   });
   if (application.status === decision.next) return;
@@ -158,14 +175,11 @@ export async function refreshApplicationStatus(applicationId: string, actorId = 
  * request that received the upload.
  */
 
-/** Enqueue work after an upload Ã¢â‚¬â€ cheap DB writes only, never OCR. */
+/** Enqueue work after an upload ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â cheap DB writes only, never OCR. */
+/** Enqueue work after an upload â€” cheap DB writes only, never decoding. */
 export async function enqueueDocumentProcessing(documentId: string): Promise<void> {
   const jobs: Array<{ type: ProcessingJob['type'] }> = [
-    { type: 'PREPROCESS' },
     { type: 'BARCODE_DETECTION' },
-    { type: 'OCR' },
-    { type: 'FIELD_EXTRACTION' },
-    { type: 'CROSS_DOCUMENT_VALIDATION' },
     { type: 'PRICE_CALCULATION' },
   ];
   await prisma.processingJob.createMany({
@@ -205,7 +219,7 @@ async function markDocumentProcessed(documentId: string): Promise<void> {
  */
 async function markDocumentNeedsReview(documentId: string, reason: string): Promise<void> {
   await prisma.processingJob.updateMany({
-    where: { documentId, type: 'OCR', status: { in: ['PENDING', 'RUNNING'] } },
+    where: { documentId, type: 'BARCODE_DETECTION', status: { in: ['PENDING', 'RUNNING'] } },
     data: { error: reason, finishedAt: new Date() },
   });
   await prisma.document.updateMany({
@@ -235,326 +249,241 @@ async function getLatestBarcodeFields(documentId: string): Promise<BarcodeFields
   return { fields, confidence: barcode.confidence };
 }
 
-// Cross-validation input is built by the shared `buildCvInput` helper in
-// `@/lib/extraction` so the pipeline and any other caller agree on the shape.
-
 /**
- * Run a single document's full pipeline synchronously (used by tests, dev
- * fallback, and the admin "re-process" action). In production this runs in a
- * background worker, but the logic is identical.
- */
-/**
- * Disc fields that change the licence fee when wrong.
+ * Count the non-empty values in a stored barcode payload.
  *
- * Read from a photo these are the values a vision model confuses (tare vs GVM
- * is the classic case), so they are always flagged for human confirmation when
- * they did not come from the barcode.
+ * Used by the status decision to tell "the disc decoded" apart from "the disc
+ * was stored but produced nothing usable". Unparseable JSON counts as zero.
  */
-const DISC_REVIEW_GATED_FIELDS = new Set([
-  'tareWeight',
-  'gvm',
-  'registrationNumber',
-  'licenceNumber',
-  'vin',
-  'chassisNumber',
-  'expiryDate',
-]);
-
-/**
- * Fallback extraction for a licence disc whose barcode could not be decoded.
- *
- * Prefers the AI provider (which reads the printed face) and otherwise uses the
- * deterministic extractor over OCR text. Any priced field is marked
- * NEEDS_REVIEW so a misread weight cannot silently set the fee, and the field
- * `source` records that it came from the photo rather than the barcode.
- */
-async function extractDiscFromPhoto(
-  code: string,
-  image: Buffer,
-  ocrText: string | null,
-  ocrWords: Array<{ text: string; confidence: number; bbox?: { x0: number; y0: number; x1: number; y1: number } }>,
-  barcodeFields: Record<string, string | null> | null
-): Promise<{ version: string; fields: ReturnType<typeof runExtraction>['fields']; overallConfidence: number | null; rawText: string | null }> {
-  let base: { version: string; fields: ReturnType<typeof runExtraction>['fields']; overallConfidence: number | null };
-  let rawText: string | null = null;
-
-  if (appConfig.ocr.engine === 'gemini' || appConfig.ocr.engine === 'cohere') {
-    const provider = getOcrProvider() as OcrProvider & { extractFields: (buffer: Buffer, type: string, barcode?: Record<string, string | null> | null) => Promise<{ fields: ReturnType<typeof runExtraction>['fields']; rawText: string | null }> };
-    const extracted = await provider.extractFields(image, code, barcodeFields);
-    const scored = extracted.fields.filter((field) => field.confidence !== null);
-    base = {
-      version: appConfig.ocr.engine === 'cohere' ? 'cohere-v1' : 'gemini-v1',
-      fields: extracted.fields,
-      overallConfidence: scored.length
-        ? scored.reduce((sum, field) => sum + (field.confidence ?? 0), 0) / scored.length
-        : null,
-    };
-    rawText = extracted.rawText;
-  } else {
-    base = runExtraction(code, {
-      rawText: ocrText ?? '',
-      words: ocrWords,
-      source: 'OCR',
-      barcodeFields,
-      barcodeConfidence: null,
-    });
-    rawText = ocrText ?? null;
+export function countBarcodeFields(decodedDataJson: unknown): number {
+  try {
+    const parsed =
+      typeof decodedDataJson === 'string'
+        ? JSON.parse(decodedDataJson)
+        : decodedDataJson;
+    const fields = (parsed as { fields?: Record<string, unknown> } | null)?.fields;
+    if (!fields || typeof fields !== 'object') return 0;
+    return Object.values(fields).filter(
+      (v) => v !== null && v !== '' && v !== undefined
+    ).length;
+  } catch {
+    return 0;
   }
+}
 
-  // Gate the priced fields. A value already confirmed by the barcode is not
-  // downgraded: if the barcode decoded this field, trust it.
-  const fields = base.fields.map((field) => {
-    const alreadyFromBarcode = field.source === 'BARCODE';
-    if (alreadyFromBarcode || !field.value) return field;
-    if (!DISC_REVIEW_GATED_FIELDS.has(field.fieldName)) return field;
-    return {
-      ...field,
-      validationStatus: 'NEEDS_REVIEW' as const,
-      validationNotes: [
-        ...(field.validationNotes ?? []),
-        'Read from the disc photo because the barcode could not be decoded — confirm this value',
-      ],
-    };
+/**
+ * Turn a decoded disc barcode into field extractions.
+ *
+ * The barcode is the ONLY data source in this application: there is no OCR and
+ * no AI extraction, so the disc's fields come exclusively from `parseDiscBarcode`
+ * and every value carries `source: 'BARCODE'`. `DocumentExtraction` rows are
+ * still written because the admin review screen, pricing resolution and the
+ * audit trail all read them â€” they are a persistence format here, not a claim
+ * that OCR or a model produced the values.
+ */
+function barcodeFieldsToExtractions(barcode: {
+  fields: Record<string, string | null>;
+  confidence: number;
+}) {
+  const fields = extractLicenceDiscFields({
+    barcodeFields: barcode.fields,
+    barcodeConfidence: barcode.confidence,
   });
-
   const scored = fields.filter((f) => f.value !== null && f.confidence !== null);
   return {
-    version: base.version,
+    version: BARCODE_EXTRACTION_VERSION,
     fields,
     overallConfidence: scored.length
       ? scored.reduce((sum, f) => sum + (f.confidence ?? 0), 0) / scored.length
       : null,
-    rawText,
   };
 }
 
-export async function runDocumentPipeline(documentId: string): Promise<void> {
+export async function runDocumentPipeline(
+  documentId: string,
+  options: { skipReprice?: boolean } = {}
+): Promise<void> {
   const document = await prisma.document.findUnique({
     where: { id: documentId },
-    include: {
-      documentType: true,
-      application: { select: { id: true } },
-    },
+    include: { documentType: true, application: { select: { id: true } } },
   });
   if (!document) return;
 
   await markDocumentProcessing(documentId);
   const storage = getStorage();
   const isPdf = document.mimeType === 'application/pdf';
-  const original = await storage.get(document.storageKey);
 
-  let ocrText: string | null = null;
-  let ocrWords: Array<{
-    text: string;
-    confidence: number;
-    bbox?: { x0: number; y0: number; x1: number; y1: number };
-  }> = [];
-  let barcodeParsed: BarcodeFieldsResult | null = null;
+  // The stored object can be gone even though its database row survives: local
+  // disk is wiped on redeploy, an object may have been deleted out of band, and
+  // a scan-created row has no image bytes at all. Reading it unguarded threw
+  // ENOENT, which failed the whole job and left the document stuck in
+  // PROCESSING. Flag it for an admin instead and stop.
+  let original: Buffer;
+  try {
+    original = await storage.get(document.storageKey);
+  } catch {
+    await markDocumentNeedsReview(
+      documentId,
+      'The stored file for this document could not be read'
+    );
+    return;
+  }
 
   // A PDF scan has no pixel data of its own, so it is rasterised once here and
-  // the page image is reused for both barcode decoding and (text-layer-less)
-  // OCR. Without this, a licence disc uploaded as PDF could never be barcode
-  // decoded, even though the barcode is printed on the page.
+  // the page image is used for barcode decoding. Without this, a licence disc
+  // uploaded as PDF could never be decoded, even though the barcode is printed
+  // on the page.
   const raster = isPdf ? await rasterizePdfPage(original, 0) : null;
 
-  // Ã¢â€â‚¬Ã¢â€â‚¬ BARCODE Ã¢â€â‚¬Ã¢â€â‚¬
+  const reprice = async () => {
+    // Pricing is driven ONLY by the licence disc barcode. The disc is the sole
+    // source of vehicle data (registration, VIN, tare, GVM, expiry), so nothing
+    // about the price can change when an ID or proof-of-residence is uploaded.
+    // Repricing on those uploads performed a multi-second chain of database
+    // round-trips to recompute an identical number, and blocked the customer
+    // waiting on the upload.
+    if (options.skipReprice) return;
+    if (document!.documentType.code !== DISC_DOCUMENT_CODE) return;
+    await recalculateApplicationPrice({
+      applicationId: document!.application.id,
+      actorId: document!.uploadedById ?? 'system',
+      updateStatus: false,
+    }).catch(() => void 0);
+  };
+
+  // Status is always re-derived: uploading a required document must move the
+  // application on even when it does not affect the price.
+  const refreshStatus = async () => {
+    await refreshApplicationStatus(
+      document!.application.id,
+      document!.uploadedById ?? 'system'
+    );
+  };
+
+  // Only the licence disc carries machine-readable data. Every other document
+  // type is stored and marked processed without producing any fields, and
+  // without triggering a reprice: it cannot change the price.
+  if (document.documentType.code !== DISC_DOCUMENT_CODE) {
+    await markDocumentProcessed(documentId);
+    await refreshStatus();
+    return;
+  }
+
+  // â”€â”€ BARCODE (the only data source) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const barcodePixels = isPdf
     ? raster
       ? await extractRawPixels(raster)
       : null
     : await extractRawPixels(original);
+
+  let barcode: BarcodeFieldsResult | null = null;
   if (barcodePixels) {
-    let barcode = null;
     const provider = getBarcodeProvider();
     try {
       // Prefer the original bytes: a disc photographed at ~400px is too small
       // for ZXing to resolve PDF417 module widths, and the provider retries at
       // larger scales. The pre-downscaled raster is only a fallback.
-      barcode = provider.decodeImage
+      const decoded = provider.decodeImage
         ? await provider.decodeImage(isPdf && raster ? raster : original)
         : await provider.decode(barcodePixels);
+      if (decoded) {
+        const parsed = parseDiscBarcode(decoded.rawValue);
+        await prisma.barcodeExtraction.create({
+          data: {
+            documentId: document.id,
+            symbology: decoded.symbology,
+            rawValue: decoded.rawValue,
+            decodedDataJson: JSON.stringify(parsed),
+            confidence: decoded.confidence,
+          },
+        });
+        barcode = { fields: parsed.fields, confidence: decoded.confidence };
+        await audit.log({
+          action: AUDIT_ACTIONS.BARCODE_PROCESSED,
+          entity: 'Barcode',
+          entityId: document.id,
+          metaData: {
+            documentId: document.id,
+            symbology: decoded.symbology,
+            fieldCount: countBarcodeFields(parsed),
+          },
+        });
+      }
     } catch {
-      // Barcode decoding is best-effort. A missing/ambiguous barcode must not
-      // prevent Gemini from extracting visible document fields.
+      // Barcode decoding is best-effort. A missing or ambiguous barcode must not
+      // crash the pipeline; the disc is flagged for review below instead.
       barcode = null;
     }
-    if (barcode) {
-      const parsed = parseDiscBarcode(barcode.rawValue);
-      await prisma.barcodeExtraction.create({
-        data: {
-          documentId: document.id,
-          symbology: barcode.symbology,
-          rawValue: barcode.rawValue,
-          decodedDataJson: JSON.stringify(parsed),
-          confidence: barcode.confidence,
-        },
-      });
-      barcodeParsed = { fields: parsed.fields, confidence: barcode.confidence };
-      await audit.log({
-        action: AUDIT_ACTIONS.BARCODE_PROCESSED,
-        entity: 'Barcode',
-        entityId: document.id,
-        metaData: { documentId: document.id, symbology: barcode.symbology },
-      });
-    }
   }
 
-  // In Gemini mode, structured AI extraction is the only document read. Do not
-  // make a second OCR request first; it adds latency, cost, and rate-limit
-  // pressure and can fail independently of structured extraction.
-  if (appConfig.ocr.engine !== 'gemini') {
-    if (!isPdf) {
-      const preprocessed = await preprocessForOcr(original, false);
-      const provider = getOcrProvider();
-      const result = await provider.recognize(preprocessed.buffer);
-      ocrText = result.text;
-      ocrWords = result.words;
-    } else {
-      ocrText = await parsePdfText(original);
-      if (!ocrText && raster) {
-        const preprocessed = await preprocessForOcr(raster, false);
-        const provider = getOcrProvider();
-        const result = await provider.recognize(preprocessed.buffer);
-        ocrText = result.text || null;
-        ocrWords = result.words;
-      }
-    }
-  }
+  // There is NO photo fallback: with no OCR and no AI, an undecodable disc
+  // simply carries no vehicle data. We persist whatever we did decode (possibly
+  // nothing) so the admin screen can show exactly what was captured.
+  const run = barcode
+    ? barcodeFieldsToExtractions({
+        fields: barcode.fields,
+        confidence: barcode.confidence ?? 0.9,
+      })
+    : { version: BARCODE_EXTRACTION_VERSION, fields: [], overallConfidence: null };
 
-  const code = document.documentType.code;
-  // A disc photo is usable even when the OCR text layer is empty: the AI
-  // providers read the image itself, and the disc fallback below must be
-  // reachable. Only bail out early for the local (non-AI) engine, which
-  // genuinely has no text to work with. The previous guard only exempted
-  // `gemini`, so with `cohere` configured the pipeline exited before ever
-  // reaching the disc fallback.
-  const isAiEngine = appConfig.ocr.engine === 'gemini' || appConfig.ocr.engine === 'cohere';
-  if (!isAiEngine && !ocrText && ocrWords.length === 0) {
-    await markDocumentNeedsReview(documentId, 'OCR produced no output');
-    return;
-  }
-  const barcodeFields = barcodeParsed ?? (await getLatestBarcodeFields(documentId));
-  // `rawText` is set by the photo fallback, so the local type must allow it.
-  let run: { version: string; fields: ReturnType<typeof runExtraction>['fields']; overallConfidence: number | null; rawText?: string | null };
-  let rawExtractionText: string | null = null;
-  // ── LICENCE DISC: barcode first, photo only as a flagged fallback ───────
-  // The disc barcode is machine-readable and authoritative for exactly the
-  // fields that drive money (tare, GVM, registration, expiry). A vision model
-  // reading the printed face is a correctness risk: on a real disc the AI read
-  // GVM 1890kg as the tare, which silently moved the customer into a heavier
-  // (and more expensive) weight bracket.
-  //
-  // So: barcode when it decodes (source BARCODE, trusted). If the barcode
-  // cannot be read, fall back to reading the photo so the application can
-  // still progress — but every money-affecting field it produces is marked
-  // NEEDS_REVIEW so an admin confirms the weight before the fee is relied on.
-  // The document also goes to DOCUMENT_REVIEW via the field status.
-  const isDisc = code === DOCUMENT_TYPE_CODES.VEHICLE_LICENCE_DISC;
-  const decodedCount = barcodeFields
-    ? Object.values(barcodeFields.fields).filter(Boolean).length
-    : 0;
-  if (isDisc && decodedCount > 0) {
-    run = runExtraction(code, {
-      // No OCR text is supplied: the disc is extracted from the barcode alone.
-      // Feeding the printed text back in let OCR values through mislabelled as
-      // BARCODE (e.g. a GVM of "18901055" built by concatenating printed
-      // figures), which is exactly the guessing this path must not do.
-      rawText: '',
-      words: [],
-      source: 'BARCODE',
-      barcodeFields: barcodeFields!.fields,
-      barcodeConfidence: barcodeFields!.confidence,
-    });
-    rawExtractionText = null;
-  } else if (isDisc) {
-    // Barcode unreadable — read the photo instead, but gate the priced fields.
-    run = await extractDiscFromPhoto(code, isPdf && raster ? raster : original, ocrText, ocrWords, barcodeFields?.fields ?? null);
-    rawExtractionText = run.rawText ?? null;
-  } else if (isAiEngine) {
-    const provider = getOcrProvider() as OcrProvider & { extractFields: (buffer: Buffer, type: string, barcode?: Record<string, string | null> | null) => Promise<{ fields: ReturnType<typeof runExtraction>['fields']; rawText: string | null }> };
-    const extracted = await provider.extractFields(isPdf && raster ? raster : original, code, barcodeFields?.fields ?? null);
-    const scored = extracted.fields.filter((field) => field.confidence !== null);
-    run = { version: appConfig.ocr.engine === 'cohere' ? 'cohere-v1' : 'gemini-v1', fields: extracted.fields, overallConfidence: scored.length ? scored.reduce((sum, field) => sum + (field.confidence ?? 0), 0) / scored.length : null };
-    rawExtractionText = extracted.rawText;
-  } else {
-    run = runExtraction(code, { rawText: ocrText ?? '', words: ocrWords, source: 'OCR', barcodeFields: barcodeFields?.fields ?? null, barcodeConfidence: barcodeFields?.confidence ?? null });
-    rawExtractionText = ocrText ?? null;
-  }
   await prisma.documentExtraction.create({
-    data: { documentId: document.id, extractionVersion: run.version, status: 'COMPLETED', rawText: rawExtractionText, extractedJson: JSON.stringify(fieldsToJson(run.fields)), confidence: run.overallConfidence, fieldExtractions: { create: run.fields.map((f) => ({ fieldName: f.fieldName, value: f.value, normalizedValue: f.normalizedValue, confidence: f.confidence, source: f.source, boundingBox: f.boundingBox ? (f.boundingBox as any) : undefined, validationStatus: f.validationStatus, validationNotes: f.validationNotes ? JSON.stringify(f.validationNotes) : undefined })) } },
-    include: { fieldExtractions: true },
+    data: {
+      documentId: document.id,
+      extractionVersion: run.version,
+      status: 'COMPLETED',
+      rawText: null,
+      extractedJson: JSON.stringify(fieldsToJson(run.fields)),
+      confidence: run.overallConfidence,
+      fieldExtractions: {
+        create: run.fields.map((f) => ({
+          fieldName: f.fieldName,
+          value: f.value,
+          normalizedValue: f.normalizedValue,
+          confidence: f.confidence,
+          source: f.source,
+          boundingBox: f.boundingBox ? (f.boundingBox as never) : undefined,
+          validationStatus: f.validationStatus,
+          validationNotes: f.validationNotes
+            ? JSON.stringify(f.validationNotes)
+            : undefined,
+        })),
+      },
+    },
   });
   await audit.log({
     action: AUDIT_ACTIONS.EXTRACTION_COMPLETED,
     entity: 'Extraction',
     entityId: document.id,
-    metaData: { documentId: document.id, fieldCount: run.fields.length },
-  });
-  await markDocumentProcessed(documentId);
-
-  // Ã¢â€â‚¬Ã¢â€â‚¬ CROSS-DOCUMENT VALIDATION Ã¢â€â‚¬Ã¢â€â‚¬
-  const allDocs = await prisma.document.findMany({
-    where: {
-      applicationId: document.application.id,
-      status: { not: 'REPLACED' },
-    },
-    include: {
-      documentType: true,
-      extractions: {
-        orderBy: { createdAt: 'desc' },
-        take: 1,
-        include: { fieldExtractions: true },
-      },
+    metaData: {
+      documentId: document.id,
+      fieldCount: run.fields.length,
+      source: 'barcode',
     },
   });
-  const cvResults = runCrossDocumentValidation(
-    buildCvInput(
-      allDocs.map((doc) => ({ documentType: doc.documentType, extractions: doc.extractions }))
-    )
-  );
 
-  for (const result of cvResults) {
-    await prisma.crossDocumentValidation.upsert({
-      where: {
-        applicationId_ruleKey: {
-          applicationId: document.application.id,
-          ruleKey: result.ruleKey,
-        },
-      },
-      update: { status: result.status, detailsJson: result.detailsJson as any },
-      create: {
-        applicationId: document.application.id,
-        ruleKey: result.ruleKey,
-        status: result.status,
-        detailsJson: result.detailsJson as any,
-      },
-    });
+  if (countBarcodeFields(barcode?.fields ?? {}) === 0) {
+    // Stored, but no vehicle data â€” the application must not price off it.
+    await markDocumentNeedsReview(
+      documentId,
+      'The licence disc barcode could not be decoded'
+    );
+  } else {
+    await markDocumentProcessed(documentId);
   }
-  await audit.log({
-    action: AUDIT_ACTIONS.CROSS_VALIDATION_RUN,
-    entity: 'CrossValidation',
-    entityId: document.application.id,
-    metaData: { ruleCount: cvResults.length },
-  });
 
-  // Ã¢â€â‚¬Ã¢â€â‚¬ PRICE Ã¢â€â‚¬Ã¢â€â‚¬
-  await recalculateApplicationPrice({
-    applicationId: document.application.id,
-    actorId: document.uploadedById ?? 'system',
-    updateStatus: false,
-  }).catch(() => void 0);
-  await refreshApplicationStatus(document.application.id, document.uploadedById ?? 'system');
-
+  // Reprice only for the disc (guarded inside), then always refresh status.
+  await reprice();
+  await refreshStatus();
 }
+
 
 /**
  * Run pending jobs (background worker entry point).
  *
  * `enqueueDocumentProcessing` writes one row per pipeline stage, but
  * `runDocumentPipeline` executes every stage in a single pass. The job rows are
- * therefore a LEDGER of that pass, not six independent units of work: without
- * grouping, one upload would pay for six full passes (six OCR runs, six
- * extraction rows, six price calculations).
+ * therefore a LEDGER of that pass, not independent units of work: without
+ * grouping, one upload would pay for several full passes.
  */
 export async function runPendingJobs(limit = 20): Promise<{ processed: number }> {
   const jobs = await prisma.processingJob.findMany({
@@ -572,7 +501,7 @@ export async function runPendingJobs(limit = 20): Promise<{ processed: number }>
     if (documentId) {
       const previous = outcome.get(documentId);
       if (previous === 'ok') {
-        // The document's pass already ran in this batch Ã¢â‚¬â€ collapse the
+        // The document's pass already ran in this batch ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â collapse the
         // remaining stage rows instead of re-running the pipeline.
         await prisma.processingJob.update({
           where: { id: job.id },

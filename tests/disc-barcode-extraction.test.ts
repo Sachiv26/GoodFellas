@@ -12,9 +12,6 @@ const barcode = {
 
 describe('licence disc extraction from barcode', () => {
   const fields = extractLicenceDiscFields({
-    rawText: '',
-    words: [],
-    source: 'BARCODE',
     barcodeFields: barcode,
     barcodeConfidence: 0.9,
   });
@@ -37,9 +34,6 @@ describe('licence disc extraction from barcode', () => {
 
   it('leaves the weight null when the barcode does not supply one', () => {
     const partial = extractLicenceDiscFields({
-      rawText: '',
-      words: [],
-      source: 'BARCODE',
       barcodeFields: { registrationNumber: 'ABC123GP' },
       barcodeConfidence: 0.9,
     });
