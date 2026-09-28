@@ -45,15 +45,16 @@ export async function middleware(req: NextRequest) {
     return NextResponse.next();
   }
 
-  // Already signed in? Send auth pages to the right landing spot.
-  if (pathname === '/login' || pathname === '/register') {
-    if (session) {
-      const dest =
-        session.role === 'ADMIN' || session.role === 'SUPER_ADMIN' ? '/admin' : '/dashboard';
-      return NextResponse.redirect(new URL(dest, req.nextUrl));
-    }
-  }
-
+  // NOTE: auth pages are intentionally NOT redirected here.
+  //
+  // `readSession` below verifies the JWT signature only — it cannot see the
+  // database, so a cookie whose user no longer exists still looks "signed in".
+  // If this middleware bounced such a cookie away from /login, the login page
+  // would send it back here, the Server Component would reject it again, and the
+  // browser would loop until it gave up with ERR_TOO_MANY_REDIRECTS. The login
+  // page itself checks the account against the database and only redirects when
+  // the session is genuinely valid, so the stale cookie renders the form and
+  // signing in replaces it.
   return NextResponse.next();
 }
 

@@ -1,6 +1,8 @@
-import { cookies } from 'next/headers';
+﻿import { cookies } from 'next/headers';
 import { NextResponse } from 'next/server';
+import { redirect } from 'next/navigation';
 import { appConfig } from '@/lib/config';
+import { prisma } from '@/lib/db';
 import {
   createSessionToken,
   verifySessionToken,
@@ -41,6 +43,7 @@ export async function getSession(): Promise<SessionPayload | null> {
   return verifySessionToken(token, appConfig.jwtSecret);
 }
 
+
 export class HttpError extends Error {
   constructor(
     public status: number,
@@ -50,10 +53,32 @@ export class HttpError extends Error {
   }
 }
 
-/** requireAuth: throws 401 if not logged in. */
+/**
+ * requireAuth: throws 401 if not logged in.
+ *
+ * The JWT is only proof that the token was signed by us and has not expired; it
+ * is NOT proof the account still exists. A cookie issued before a database
+ * reseed, a restore, or a user deletion keeps verifying successfully while its
+ * `sub` no longer resolves, and any route that then writes `userId: session.sub`
+ * fails with a raw Prisma P2003 foreign-key error surfaced to the user as an
+ * opaque 500. Re-checking the user here turns that into an honest 401 and, more
+ * importantly, prevents the write from being attempted at all.
+ */
 export async function requireAuth(): Promise<SessionPayload> {
   const session = await getSession();
   if (!session) throw new HttpError(401, 'Authentication required');
+  const user = await prisma.user.findUnique({
+    where: { id: session.sub },
+    select: { id: true, isActive: true },
+  });
+  if (!user) {
+    // The account behind this cookie no longer exists. Sign the user out so the
+    // browser stops replaying a cookie that can never become valid again.
+    throw new HttpError(401, 'Your session is no longer valid. Please sign in again.');
+  }
+  if (!user.isActive) {
+    throw new HttpError(403, 'This account has been deactivated.');
+  }
   return session;
 }
 
@@ -64,6 +89,47 @@ export async function requireRole(roles: UserRole[]): Promise<SessionPayload> {
     throw new HttpError(403, 'Insufficient permissions');
   }
   return session;
+}
+
+/**
+ * Server-Component-safe authentication.
+ *
+ * `requireAuth` throws an `HttpError`, which is correct inside a route handler
+ * (the handler catches it and returns a JSON status) but wrong inside a Server
+ * Component: nothing catches it there, so an invalid or stale session rendered
+ * Next.js's "Unhandled Runtime Error" overlay instead of sending the visitor to
+ * the sign-in page. These helpers redirect instead of throwing, so a stale
+ * cookie always lands on `/login` and can be replaced by signing in again.
+ */
+export async function requirePageAuth(nextPath?: string): Promise<SessionPayload> {
+  const session = await getSession();
+  if (session) {
+    const user = await prisma.user.findUnique({
+      where: { id: session.sub },
+      select: { id: true, isActive: true },
+    });
+    if (user && user.isActive) return session;
+  }
+  redirectToLogin(nextPath);
+}
+
+export async function requirePageRole(
+  roles: UserRole[],
+  nextPath?: string
+): Promise<SessionPayload> {
+  const session = await requirePageAuth(nextPath);
+  if (!roles.includes(session.role)) redirect('/dashboard');
+  return session;
+}
+
+/**
+ * Send an unauthenticated visitor to the sign-in page, preserving where they
+ * were headed so login can return them there.
+ */
+function redirectToLogin(nextPath?: string): never {
+  const target = new URL('/login', process.env.APP_URL ?? 'http://localhost:3000');
+  if (nextPath) target.searchParams.set('next', nextPath);
+  redirect(target.pathname + target.search);
 }
 
 export function isAdmin(session: SessionPayload | null): boolean {
