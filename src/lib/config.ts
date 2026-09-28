@@ -18,14 +18,12 @@ export const appConfig = {
     secretKey: process.env.STORAGE_SECRET_KEY ?? '',
     endpoint: process.env.STORAGE_ENDPOINT ?? '',
   },
+  // NOTE: there is no AI/vision provider and no OCR engine. The only document
+  // data source is the licence disc barcode, decoded locally with ZXing.
+  // `cacheDir` is retained because the barcode pipeline still uses the shared
+  // image preprocessing helpers.
   ocr: {
-    engine: (process.env.OCR_ENGINE ?? 'tesseract') as 'tesseract' | 'gemini' | 'cohere',
     cacheDir: process.env.TESSERACT_CACHE_DIR ?? './tessdata',
-    lang: process.env.TESSERACT_LANG ?? 'eng',
-    geminiApiKey: process.env.GEMINI_API_KEY ?? '',
-    geminiModel: process.env.GEMINI_MODEL ?? 'gemini-3.6-flash',
-    cohereApiKey: process.env.COHERE_API_KEY ?? '',
-    cohereModel: process.env.COHERE_MODEL ?? 'command-a-vision-07-2025',
   },
   barcode: { engine: (process.env.BARCODE_ENGINE ?? 'zxing') as 'zxing' },
   payment: {
