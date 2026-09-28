@@ -1,12 +1,20 @@
 import { describe, expect, it, jest, beforeEach } from '@jest/globals';
 import { POST } from '@/app/api/documents/route';
 import { enqueueDocumentProcessing } from '@/server/services/processing-service';
+import { kickOffProcessing } from '@/server/services/document-worker';
 
 jest.mock('@/server/services/processing-service', () => ({
   enqueueDocumentProcessing: jest.fn(async () => undefined),
   reenqueueDocumentPipeline: jest.fn(async () => undefined),
   runDocumentPipeline: jest.fn(async () => undefined),
   runPendingJobs: jest.fn(async () => ({ processed: 0 })),
+}));
+
+// The upload route must never run the pipeline inline: that was the ~15s wait.
+// It hands the work to the background worker instead, which this mocks so the
+// assertion below can prove the handoff happened.
+jest.mock('@/server/services/document-worker', () => ({
+  kickOffProcessing: jest.fn(),
 }));
 
 const enc = (v: unknown) => new TextEncoder().encode(JSON.stringify(v));
@@ -22,6 +30,14 @@ describe('POST /api/documents', () => {
   it('returns 401 for unauthenticated upload attempts', async () => {
     const res = await POST(baseReq(new FormData()));
     expect(res.status).toBe(401);
+  });
+
+  it('does not run the processing pipeline inline on the request path', async () => {
+    // The performance contract: an unauthenticated request is rejected before
+    // any work is scheduled, so nothing may have been kicked off.
+    jest.mocked(kickOffProcessing).mockClear();
+    await POST(baseReq(new FormData()));
+    expect(jest.mocked(kickOffProcessing)).not.toHaveBeenCalled();
   });
 
   it('never returns storage keys to the customer', async () => {

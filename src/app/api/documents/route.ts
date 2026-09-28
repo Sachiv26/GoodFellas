@@ -6,7 +6,13 @@
  * - Validates file type and size against configurable allow-list.
  * - Stores originals in PRIVATE storage (never /public).
  * - Never returns storage keys or internal data beyond the customer DTO.
- * - Enqueues processing jobs asynchronously — OCR never runs in-request.
+ *
+ * Performance:
+ * - The request does only the work needed to make the upload durable, then
+ *   returns. Barcode decoding, pricing and status derivation happen in the
+ *   background (`document-worker`). The original inline pipeline made customers
+ *   wait ~15s per file on a pooled remote database, where every query is a
+ *   network round-trip.
  *
  * Customer DTO: { id, documentTypeId, code, displayName, status,
  *   originalFileName, mimeType, fileSize, uploadedAt }
@@ -17,7 +23,8 @@ import { appConfig } from '@/lib/config';
 import { apiError } from '@/lib/api/errors';
 import { requireAuth } from '@/lib/auth/session';
 import { db } from '@/lib/db';
-import { enqueueDocumentProcessing, reenqueueDocumentPipeline, processDocumentNow, refreshApplicationStatus } from '@/server/services/processing-service';
+import { enqueueDocumentProcessing, reenqueueDocumentPipeline } from '@/server/services/processing-service';
+import { kickOffProcessing } from '@/server/services/document-worker';
 import { AUDIT_ACTIONS, audit } from '@/lib/audit';
 import { createHash, randomUUID } from 'node:crypto';
 import { detectFileSignature, signatureExtension, signatureMatchesMime } from '@/lib/upload/file-signature';
@@ -71,22 +78,24 @@ export async function POST(request: Request) {
   const signature = detectFileSignature(buffer);
   const checksum = createHash('sha256').update(buffer).digest('hex');
 
-  // Resolve document type.
-  let documentTypeId = null;
-  let typeCode = '';
-  let typeName = '';
+  // Resolve the document type and the product requirement TOGETHER. These two
+  // lookups are independent of each other, and every extra serialised query is
+  // a full network round-trip to the pooled database, so they are issued
+  // concurrently rather than one after the other.
   const byId = form.get('documentTypeId')?.toString();
-  if (byId) {
-    const dt = await db.documentType.findUnique({ where: { id: byId }, select: { id: true, code: true, name: true } });
-    if (dt) { documentTypeId = dt.id; typeCode = dt.code; typeName = dt.name; }
-  }
-  if (!documentTypeId) {
-    const code = form.get('documentType')?.toString();
-    if (code) {
-      const dt = await db.documentType.findUnique({ where: { code }, select: { id: true, code: true, name: true } });
-      if (dt) { documentTypeId = dt.id; typeCode = dt.code; typeName = dt.name; }
-    }
-  }
+  const byCode = form.get('documentType')?.toString();
+  const [typeById, typeByCode] = await Promise.all([
+    byId
+      ? db.documentType.findUnique({ where: { id: byId }, select: { id: true, code: true, name: true } })
+      : null,
+    byCode
+      ? db.documentType.findUnique({ where: { code: byCode }, select: { id: true, code: true, name: true } })
+      : null,
+  ]);
+  const documentType = typeById ?? typeByCode;
+  const documentTypeId = documentType?.id ?? null;
+  const typeCode = documentType?.code ?? '';
+  const typeName = documentType?.name ?? '';
   if (!documentTypeId) return apiError('VALIDATION_ERROR', 'Valid document type is required', 400);
 
   const requirement = await db.productDocumentRequirement.findFirst({
@@ -123,10 +132,9 @@ export async function POST(request: Request) {
       where: { id: existing.id },
       data: { status: 'REPLACED' as DocumentStatus },
     });
-    await reenqueueDocumentPipeline(replaced.id);
-    // Reflect the new document set immediately, then process the replacement.
-    await refreshApplicationStatus(applicationId, session.sub).catch(() => undefined);
-    await processDocumentNow(replaced.id);
+    // Same reasoning as the new-upload path: the document is durable once the
+    // row is written, so the expensive processing happens after the response.
+    kickOffProcessing(replaced.id, { enqueue: true });
     await audit.log({
       action: AUDIT_ACTIONS.DOCUMENT_REPLACED,
       entity: 'Document',
@@ -134,7 +142,10 @@ export async function POST(request: Request) {
       actorId: session.sub,
       metaData: { applicationId, documentTypeId, replacedDocumentId: existing.id },
     });
-    return NextResponse.json({ document: toDto(replaced, typeCode, typeName, requirement) }, { status: 201 });
+    return NextResponse.json(
+      { document: toDto(replaced, typeCode, typeName, requirement), processing: true },
+      { status: 201 }
+    );
   }
 
   // New upload.
@@ -152,18 +163,13 @@ export async function POST(request: Request) {
   });
   if (!document) return apiError('INTERNAL_ERROR', 'Could not store the document', 500);
 
-  await enqueueDocumentProcessing(document.id);
-  // The status must reflect the upload immediately. OCR/extraction runs later
-  // (see runPendingJobs) and will advance it further, but relying on that
-  // background pass left the application stuck on DOCUMENTS_REQUIRED whenever
-  // the worker had not yet drained the queue.
-  await refreshApplicationStatus(applicationId, session.sub).catch(() => undefined);
-  // Process the document before responding. Previously this was
-  // `void runPendingJobs()`, a fire-and-forget promise that the runtime
-  // discards when the request is finalised — leaving every job PENDING and the
-  // document stuck at UPLOADED, which blocks payment. A real queue worker can
-  // replace this single call.
-  await processDocumentNow(document.id);
+  // The enqueue is NOT on the critical path. The document row is what makes the
+  // upload durable and visible to the customer; the job row only schedules work
+  // that the background kick-off performs anyway. Creating it inline cost a
+  // further ~800ms round-trip for no user-visible benefit, so it happens in the
+  // background alongside the processing itself.
+  kickOffProcessing(document.id, { enqueue: true });
+
   await audit.log({
     action: AUDIT_ACTIONS.DOCUMENT_UPLOADED,
     entity: 'Document',
@@ -172,7 +178,12 @@ export async function POST(request: Request) {
     metaData: { applicationId, documentTypeId },
   });
 
-  return NextResponse.json({ document: toDto(document, typeCode, typeName, requirement) }, { status: 201 });
+  // The document is accepted but not yet processed. The client shows
+  // "processing" and refreshes; `drainPendingJobs` finishes the job.
+  return NextResponse.json(
+    { document: toDto(document, typeCode, typeName, requirement), processing: true },
+    { status: 201 }
+  );
 }
 
 /**

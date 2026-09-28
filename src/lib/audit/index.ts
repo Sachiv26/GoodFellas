@@ -38,6 +38,7 @@ export const AUDIT_ACTIONS = {
   DOCUMENT_ACCESSED: 'DOCUMENT_ACCESSED',
   DOCUMENT_DELETED: 'DOCUMENT_DELETED',
   OCR_PROCESSED: 'OCR_PROCESSED',
+  PROCESSING_DRAINED: 'PROCESSING_DRAINED',
   BARCODE_PROCESSED: 'BARCODE_PROCESSED',
   EXTRACTION_COMPLETED: 'EXTRACTION_COMPLETED',
   MANUAL_CORRECTION: 'MANUAL_CORRECTION',
@@ -51,9 +52,21 @@ export const AUDIT_ACTIONS = {
   ADMIN_ACTION: 'ADMIN_ACTION',
 } as const;
 
-async function writeAudit(entry: AuditEntry): Promise<void> {
-  try {
-    await prisma.auditLog.create({
+/**
+ * Write an audit row.
+ *
+ * Deliberately NOT awaited by callers. An audit insert is a single extra
+ * round-trip to the database, and on a pooled remote connection that is a few
+ * hundred milliseconds on a request the customer is waiting on. The audit trail
+ * records what happened; it does not decide the response, so it is fired and
+ * forgotten and must never slow down — or fail — the operation it describes.
+ *
+ * Failures are logged rather than thrown: an audit problem must not break the
+ * business operation.
+ */
+function writeAudit(entry: AuditEntry): void {
+  void prisma.auditLog
+    .create({
       data: {
         actorId: entry.actorId ?? null,
         actorRole: entry.actorRole ?? null,
@@ -63,18 +76,22 @@ async function writeAudit(entry: AuditEntry): Promise<void> {
         metaData: (entry.metaData ?? {}) as object,
         ipAddress: entry.ipAddress ?? null,
       },
+    })
+    .catch((err) => {
+      // Audit failures must never break the main flow, but must be visible.
+      console.error(
+        '[audit] failed to record:',
+        entry.action,
+        err instanceof Error ? err.message : err
+      );
     });
-  } catch (err) {
-    // Audit failures must never break the main flow, but must be visible.
-    console.error('[audit] failed to record:', entry.action, err instanceof Error ? err.message : err);
-  }
 }
 
 /**
  * `audit(entry)` and `audit.log(entry)` are equivalent entry points so route
  * handlers can adopt either style.
  */
-export const audit: ((entry: AuditEntry) => Promise<void>) & {
-  log: (entry: AuditEntry) => Promise<void>;
+export const audit: ((entry: AuditEntry) => void) & {
+  log: (entry: AuditEntry) => void;
 } = Object.assign(writeAudit, { log: writeAudit });
 

@@ -2,6 +2,13 @@
  * Pricing repository — loads the pricing configuration from the database and
  * maps it into the pure engine types. Nothing about fees lives in code: the
  * repository only reshapes rows.
+ *
+ * The loaded configuration is cached in-process for a short window. Pricing
+ * configuration changes only when an admin edits it, but it was being re-read
+ * from the database on EVERY reprice — and against a pooled remote database
+ * (~280ms per round-trip) those two queries cost over 2s of an upload that the
+ * user waits on. The TTL keeps the cost off the hot path while still picking
+ * up admin edits promptly.
  */
 import type { PricingComponentKind, PricingRule } from '@prisma/client';
 import { prisma } from '@/lib/db';
@@ -31,8 +38,39 @@ export interface LoadPricingOptions {
   effectiveAt?: Date;
 }
 
+/**
+ * How long a loaded pricing configuration is reused before it is re-read.
+ *
+ * Deliberately short: an admin editing a fee should see it applied within
+ * seconds, and the cache only exists to keep repeated reprices (which happen on
+ * every upload) off the database.
+ */
+const PRICING_CACHE_TTL_MS = 30_000;
+
+/**
+ * Cache keyed by product id. Entries hold the parsed configuration plus the
+ * day it was effective for, because rule effectiveness is date-dependent: a
+ * config loaded for "today" must not be reused for a different date without
+ * re-filtering.
+ */
+const pricingCache = new Map<
+  string,
+  { config: PricingConfig; effectiveDay: string; expiresAt: number }
+>();
+
+/** Drop the cached configuration for a product (call after an admin edit). */
+export function invalidatePricingCache(productId?: string): void {
+  if (productId) pricingCache.delete(productId);
+  else pricingCache.clear();
+}
+
 export async function loadPricingConfig(options: LoadPricingOptions): Promise<PricingConfig> {
   const effectiveAt = options.effectiveAt ?? new Date();
+  const effectiveDay = effectiveAt.toISOString().slice(0, 10);
+  const cached = pricingCache.get(options.productId);
+  if (cached && cached.expiresAt > Date.now() && cached.effectiveDay === effectiveDay) {
+    return cached.config;
+  }
 
   const [components, tables] = await Promise.all([
     prisma.pricingComponent.findMany({
@@ -67,13 +105,21 @@ export async function loadPricingConfig(options: LoadPricingOptions): Promise<Pr
     entries: table.entries.map(toLookupEntry),
   }));
 
-  return {
+  const config: PricingConfig = {
     version,
     currency: 'ZAR',
-    effectiveFrom: effectiveAt.toISOString().slice(0, 10),
+    effectiveFrom: effectiveDay,
     lookups: lookupConfigs,
     components: componentConfigs,
   };
+
+  pricingCache.set(options.productId, {
+    config,
+    effectiveDay,
+    expiresAt: Date.now() + PRICING_CACHE_TTL_MS,
+  });
+
+  return config;
 }
 
 function isRuleEffective(rule: PricingRule, at: Date): boolean {
