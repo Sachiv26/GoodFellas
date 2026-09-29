@@ -31,7 +31,7 @@
  * work is simply retried on the next drain.
  */
 import { prisma } from '@/lib/db';
-import { runDocumentPipeline, enqueueDocumentProcessing } from './processing-service';
+import { runDocumentPipeline } from './processing-service';
 import { audit, AUDIT_ACTIONS } from '@/lib/audit';
 
 /**
@@ -40,22 +40,10 @@ import { audit, AUDIT_ACTIONS } from '@/lib/audit';
  * Returns immediately. The promise is deliberately not awaited anywhere on the
  * request path; `drainPendingJobs` is the safety net if it never completes.
  */
-export function kickOffProcessing(
-  documentId: string,
-  options: { enqueue?: boolean } = {}
-): void {
-  void (async () => {
-    // Create the durable job row first, but only when the caller did not
-    // already do so. It is written here rather than in the request because it
-    // costs a round-trip and nothing about the customer-visible upload depends
-    // on it existing yet.
-    if (options.enqueue) {
-      await enqueueDocumentProcessing(documentId);
-    }
-    await claimAndRun(documentId);
-  })().catch((error) => {
-    // Never let a background failure surface as an unhandled rejection: the job
-    // row stays PENDING and the drain will retry it.
+export function kickOffProcessing(documentId: string): void {
+  void claimAndRun(documentId).catch((error) => {
+    // Never let a background failure surface as an unhandled rejection. On
+    // failure the job row is put back to PENDING, so `drainPendingJobs` retries.
     console.error(
       '[worker] kick-off failed for document',
       documentId,

@@ -23,6 +23,43 @@ export interface PriceCalculationOutcome {
 }
 
 /**
+ * Which required document types are still missing from an application.
+ *
+ * A REPLACED document does not count: the customer keeps its slot, the
+ * replacement is the live one.
+ */
+export async function findMissingRequiredDocuments(
+  applicationId: string
+): Promise<string[]> {
+  const application = await prisma.application.findUnique({
+    where: { id: applicationId },
+    select: {
+      product: {
+        select: {
+          documentRequirements: {
+            where: { active: true, required: true },
+            select: {
+              documentTypeId: true,
+              documentType: { select: { code: true } },
+            },
+          },
+        },
+      },
+      documents: {
+        where: { status: { not: 'REPLACED' } },
+        select: { documentTypeId: true },
+      },
+    },
+  });
+  if (!application) return [];
+
+  const present = new Set(application.documents.map((d) => d.documentTypeId));
+  return application.product.documentRequirements
+    .filter((r) => !present.has(r.documentTypeId))
+    .map((r) => r.documentType.code);
+}
+
+/**
  * Build the engine inputs from the resolved application view. Values that
  * could not be determined are passed through as null so a rule can decide
  * (and the admin can see) that the input was unavailable.
@@ -47,13 +84,34 @@ export function buildPricingInputs(data: ResolvedApplicationData): PricingInputs
   };
 }
 
-/** Calculate and persist a price for an application. Admin-only call sites. */
+/**
+ * Calculate and persist a price for an application.
+ *
+ * Refuses to calculate until every REQUIRED document has been uploaded. The
+ * gate lives here, in the single function every caller goes through, rather
+ * than at each call site: it was previously possible to price an application
+ * with documents still missing, because the only condition was "the disc
+ * barcode has been scanned".
+ *
+ * `requireCompleteDocuments: false` exists solely for an admin recomputing a
+ * historical figure by hand.
+ */
 export async function recalculateApplicationPrice(options: {
   applicationId: string;
   actorId: string;
   deliveryRequested?: boolean;
   updateStatus?: boolean;
-}): Promise<PriceCalculationOutcome> {
+  requireCompleteDocuments?: boolean;
+}): Promise<PriceCalculationOutcome | null> {
+  if (options.requireCompleteDocuments !== false) {
+    const missing = await findMissingRequiredDocuments(options.applicationId);
+    if (missing.length > 0) {
+      // Not an error: the application is simply not ready to be priced yet.
+      // Callers treat a null result as "nothing to do".
+      return null;
+    }
+  }
+
   const data = await resolveApplicationData(options.applicationId);
   const config = await loadPricingConfig({
     productId: data.application.productId,

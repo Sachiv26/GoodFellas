@@ -14,7 +14,7 @@ import { apiError } from '@/lib/api/errors';
 import { parseDiscBarcode } from '@/lib/extraction/barcode-parser';
 import { extractLicenceDiscFields } from '@/lib/extraction/disc-extractor';
 import { fieldsToJson } from '@/lib/extraction';
-import { recalculateApplicationPrice, } from '@/server/services/pricing-service';
+import { recalculateApplicationPrice, findMissingRequiredDocuments } from '@/server/services/pricing-service';
 import { refreshApplicationStatus } from '@/server/services/processing-service';
 import { audit, AUDIT_ACTIONS } from '@/lib/audit';
 import { DOCUMENT_TYPE_CODES } from '@/lib/extraction';
@@ -150,17 +150,24 @@ export async function POST(request: Request, { params }: { params: { id: string 
     metaData: { applicationId: application.id, documentId: document.id, source: 'realtime-scan', fieldCount },
   });
 
-  await recalculateApplicationPrice({
+  // Calculate only if every required document is now present — the gate lives
+  // in `recalculateApplicationPrice`. `priced: false` tells the UI the scan was
+  // stored but the price is not final until the remaining documents arrive.
+  const outcome = await recalculateApplicationPrice({
     applicationId: application.id,
     actorId: session.sub,
     updateStatus: false,
-  }).catch(() => void 0);
+  }).catch(() => null);
   await refreshApplicationStatus(application.id, session.sub).catch(() => undefined);
+
+  const missing = await findMissingRequiredDocuments(application.id);
 
   return NextResponse.json({
     ok: true,
     documentId: document.id,
     fieldCount,
+    priced: outcome !== null,
+    missingDocuments: missing,
     warnings: parsed.warnings,
   });
 }

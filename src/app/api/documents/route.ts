@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Document upload API.
  *
  * Security:
@@ -132,9 +132,10 @@ export async function POST(request: Request) {
       where: { id: existing.id },
       data: { status: 'REPLACED' as DocumentStatus },
     });
-    // Same reasoning as the new-upload path: the document is durable once the
-    // row is written, so the expensive processing happens after the response.
-    kickOffProcessing(replaced.id, { enqueue: true });
+    // The job row is written inline for the same durability reason as the
+    // new-upload path; only the processing itself is deferred.
+    await reenqueueDocumentPipeline(replaced.id);
+    kickOffProcessing(replaced.id);
     await audit.log({
       action: AUDIT_ACTIONS.DOCUMENT_REPLACED,
       entity: 'Document',
@@ -163,12 +164,20 @@ export async function POST(request: Request) {
   });
   if (!document) return apiError('INTERNAL_ERROR', 'Could not store the document', 500);
 
-  // The enqueue is NOT on the critical path. The document row is what makes the
-  // upload durable and visible to the customer; the job row only schedules work
-  // that the background kick-off performs anyway. Creating it inline cost a
-  // further ~800ms round-trip for no user-visible benefit, so it happens in the
-  // background alongside the processing itself.
-  kickOffProcessing(document.id, { enqueue: true });
+  // The durable job row is written INLINE, before responding.
+  //
+  // It must not be moved into the background: a serverless runtime can discard
+  // that background work the instant the response is sent, and if the row is
+  // never created there is nothing for `drainPendingJobs` to find — the upload
+  // would be silently lost and the document stuck at UPLOADED forever. This
+  // one round-trip is the price of durability, and it is the only thing standing
+  // between a frozen process and a permanently stuck document.
+  await enqueueDocumentProcessing(document.id);
+
+  // Everything expensive happens after the response: decoding the barcode,
+  // calculating the price and deriving the status are all long chains of
+  // database round-trips that the customer should not wait for.
+  kickOffProcessing(document.id);
 
   await audit.log({
     action: AUDIT_ACTIONS.DOCUMENT_UPLOADED,

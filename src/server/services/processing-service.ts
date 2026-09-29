@@ -336,14 +336,13 @@ export async function runDocumentPipeline(
   const raster = isPdf ? await rasterizePdfPage(original, 0) : null;
 
   const reprice = async () => {
-    // Pricing is driven ONLY by the licence disc barcode. The disc is the sole
-    // source of vehicle data (registration, VIN, tare, GVM, expiry), so nothing
-    // about the price can change when an ID or proof-of-residence is uploaded.
-    // Repricing on those uploads performed a multi-second chain of database
-    // round-trips to recompute an identical number, and blocked the customer
-    // waiting on the upload.
+    // A calculation is only ever written when every REQUIRED document is
+    // present. That rule is enforced inside `recalculateApplicationPrice`, so
+    // every call site gets it for free and none can bypass it — and it is why
+    // this is called for every document type, not just the disc: whichever
+    // upload completes the set is the one that moves the price forward, and
+    // the disc may not be last.
     if (options.skipReprice) return;
-    if (document!.documentType.code !== DISC_DOCUMENT_CODE) return;
     await recalculateApplicationPrice({
       applicationId: document!.application.id,
       actorId: document!.uploadedById ?? 'system',
@@ -361,10 +360,14 @@ export async function runDocumentPipeline(
   };
 
   // Only the licence disc carries machine-readable data. Every other document
-  // type is stored and marked processed without producing any fields, and
-  // without triggering a reprice: it cannot change the price.
+  // type is stored and marked processed without producing any fields.
   if (document.documentType.code !== DISC_DOCUMENT_CODE) {
     await markDocumentProcessed(documentId);
+    // Still attempt a calculation: the gate inside
+    // `recalculateApplicationPrice` decides whether every required document is
+    // now present. Uploading the LAST missing document has to be able to
+    // trigger pricing, and the disc may have been uploaded before this one.
+    await reprice();
     await refreshStatus();
     return;
   }
