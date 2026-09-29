@@ -21,7 +21,7 @@ export const appConfig = {
   // NOTE: there is no AI/vision provider and no OCR engine. The only document
   // data source is the licence disc barcode, decoded locally with ZXing.
   // `cacheDir` is retained because the barcode pipeline still uses the shared
-  // image preprocessing helpers.
+  // image preprocessing helpers, which look for tessdata by convention.
   ocr: {
     cacheDir: process.env.TESSERACT_CACHE_DIR ?? './tessdata',
   },
